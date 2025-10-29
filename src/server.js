@@ -21,15 +21,56 @@ const app = express();
 
 // ============ MIDDLEWARE ============
 
-// 1. CORS - Allow frontend to call backend
+// 1. CORS - Allow frontend to call backend (UPDATED)
 app.use(cors({
-  origin: CORS_ORIGIN, // Allow requests from frontend URL
-  credentials: true, // Allow cookies/auth headers
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or Postman)
+    if (!origin) {
+      return callback(null, true);
+    }
+    
+    // Get allowed origins from environment variable
+    const allowedOrigins = CORS_ORIGIN.split(',').map(o => o.trim());
+    
+    // Check if origin matches any allowed origin
+    const isAllowed = allowedOrigins.some(allowedOrigin => {
+      // Allow all origins with wildcard
+      if (allowedOrigin === '*') {
+        return true;
+      }
+      
+      // Exact match
+      if (allowedOrigin === origin) {
+        return true;
+      }
+      
+      // Support wildcard subdomains like *.vercel.app
+      if (allowedOrigin.includes('*')) {
+        const pattern = allowedOrigin.replace(/\*/g, '.*');
+        const regex = new RegExp('^' + pattern + '$');
+        return regex.test(origin);
+      }
+      
+      return false;
+    });
+    
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      console.log('❌ CORS blocked origin:', origin);
+      callback(null, false);
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Length', 'Content-Type'],
+  maxAge: 86400, // Cache preflight for 24 hours
 }));
 
 // 2. Body Parsers - Parse JSON and URL-encoded data
-app.use(express.json()); // Parse JSON bodies
-app.use(express.urlencoded({ extended: true })); // Parse URL-encoded bodies
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // 3. Request Logging (development only)
 if (NODE_ENV === 'development') {
@@ -75,7 +116,7 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({
     success: false,
     message: err.message || 'Internal server error',
-    ...(NODE_ENV === 'development' && { stack: err.stack }), // Show stack trace in dev
+    ...(NODE_ENV === 'development' && { stack: err.stack }),
   });
 });
 
