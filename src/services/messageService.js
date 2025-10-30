@@ -169,7 +169,7 @@ const searchChats = async (userId, searchTerm) => {
     const chats = await Message.aggregate([
       {
         $match: {
-          userId: require('mongoose').Types.ObjectId(userId),
+          userId: new require('mongoose').Types.ObjectId(userId),
           $or: [
             { chatName: regex }, // Search by display name
             { chatId: regex },   // Search by phone number/ID
