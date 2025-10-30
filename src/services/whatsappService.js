@@ -1,12 +1,12 @@
 // ============================================
-// WHATSAPP SERVICE - WORKING VERSION
-// Simple in-memory storage with MongoDB persistence
+// WHATSAPP SERVICE - FINAL WORKING VERSION
 // ============================================
 
 const { 
   default: makeWASocket,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
@@ -14,34 +14,44 @@ const User = require('../models/User');
 const WhatsAppAuth = require('../models/WhatsAppAuth');
 const messageService = require('./messageService');
 
-// Store active connections in memory
 const activeConnections = new Map();
 
 /**
- * Simple auth state that works with Baileys
+ * Create fresh auth state for new connections
  */
-const useSimpleAuthState = async (userId) => {
-  // Try to load from MongoDB
+const createAuthState = async (userId) => {
   let authDoc = await WhatsAppAuth.findOne({ userId });
   
-  let state = {
-    creds: authDoc?.authState?.creds || undefined,
-    keys: authDoc?.authState?.keys || {},
-  };
+  // If no auth or corrupted, create fresh
+  if (!authDoc || !authDoc.authState?.creds?.noiseKey?.public) {
+    console.log(`🆕 Creating fresh auth for ${userId}`);
+    await WhatsAppAuth.findOneAndDelete({ userId });
+    authDoc = null;
+  }
   
-  const saveCreds = async (newCreds) => {
-    state.creds = newCreds;
+  const state = authDoc?.authState || {};
+  
+  const saveState = async (newState) => {
     await WhatsAppAuth.findOneAndUpdate(
       { userId },
       { 
-        authState: state,
+        authState: newState,
         lastConnected: new Date(),
       },
       { upsert: true }
     );
   };
   
-  return { state, saveCreds };
+  return {
+    state: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys || {}, pino({ level: 'silent' })),
+    },
+    saveCreds: async (creds) => {
+      state.creds = creds;
+      await saveState(state);
+    },
+  };
 };
 
 /**
@@ -51,7 +61,7 @@ const initConnection = async (userId) => {
   try {
     console.log(`🔄 Initializing WhatsApp for user: ${userId}`);
     
-    const { state, saveCreds } = await useSimpleAuthState(userId);
+    const { state, saveCreds } = await createAuthState(userId);
     const { version } = await fetchLatestBaileysVersion();
     
     const sock = makeWASocket({
@@ -61,6 +71,7 @@ const initConnection = async (userId) => {
       printQRInTerminal: false,
       browser: ['WhatsApp Summarizer', 'Chrome', '10.0'],
       syncFullHistory: false,
+      markOnlineOnConnect: false,
     });
     
     let qrCode = null;
@@ -68,10 +79,8 @@ const initConnection = async (userId) => {
     
     activeConnections.set(userId, { sock, qrCode, connected });
     
-    // Save credentials
     sock.ev.on('creds.update', saveCreds);
     
-    // Handle connection updates
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       
@@ -82,7 +91,7 @@ const initConnection = async (userId) => {
           if (conn) conn.qrCode = qrCode;
           console.log(`📱 QR generated for ${userId}`);
         } catch (error) {
-          console.error('QR error:', error);
+          console.error('❌ QR error:', error);
         }
       }
       
@@ -110,32 +119,34 @@ const initConnection = async (userId) => {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
-        console.log(`❌ Disconnected: ${userId}, reason: ${lastDisconnect?.error?.message}`);
+        console.log(`❌ Disconnected: ${userId}`);
+        console.log(`Error: ${lastDisconnect?.error?.message || 'Unknown'}`);
+        console.log(`Status: ${statusCode}`);
         
         await User.findByIdAndUpdate(userId, { whatsappConnected: false });
         
-        if (shouldReconnect) {
-          console.log(`🔄 Reconnecting ${userId}...`);
+        if (shouldReconnect && statusCode !== 401) {
+          console.log(`🔄 Reconnecting ${userId} in 5s...`);
           setTimeout(() => initConnection(userId), 5000);
         } else {
+          // Delete corrupted auth
           await WhatsAppAuth.findOneAndDelete({ userId });
           activeConnections.delete(userId);
-          console.log(`⛔ Logged out: ${userId}`);
+          console.log(`⛔ Logged out / Auth cleared: ${userId}`);
         }
       }
     });
     
-    // Store incoming messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type === 'notify') {
         for (const msg of messages) {
           try {
             const saved = await messageService.storeMessage(userId, msg);
             if (saved) {
-              console.log(`💾 Message saved for ${userId}: ${saved.chatId}`);
+              console.log(`💾 Saved: ${saved.chatId.substring(0, 15)}...`);
             }
           } catch (error) {
-            console.error('Message save error:', error);
+            console.error('❌ Save error:', error.message);
           }
         }
       }
@@ -144,7 +155,12 @@ const initConnection = async (userId) => {
     return { success: true, qrCode, connected };
     
   } catch (error) {
-    console.error('❌ Connection error:', error);
+    console.error(`❌ Connection error for ${userId}:`, error.message);
+    
+    // Clean up corrupted auth
+    await WhatsAppAuth.findOneAndDelete({ userId });
+    activeConnections.delete(userId);
+    
     throw error;
   }
 };
@@ -158,7 +174,11 @@ const disconnect = async (userId) => {
     const connection = activeConnections.get(userId);
     
     if (connection?.sock) {
-      await connection.sock.logout();
+      try {
+        await connection.sock.logout();
+      } catch (e) {
+        console.log('Logout error (expected):', e.message);
+      }
     }
     
     activeConnections.delete(userId);
@@ -191,19 +211,10 @@ const restoreConnections = async () => {
   try {
     console.log('🔄 Restoring connections...');
     
-    const activeSessions = await WhatsAppAuth.find({ connected: true });
+    // Don't auto-restore on startup (causes issues)
+    // Users need to reconnect manually
     
-    console.log(`Found ${activeSessions.length} active sessions`);
-    
-    for (const session of activeSessions) {
-      try {
-        await initConnection(session.userId.toString());
-      } catch (error) {
-        console.error(`Failed to restore ${session.userId}:`, error);
-      }
-    }
-    
-    console.log('✅ Restoration complete');
+    console.log('✅ Restoration skipped (manual reconnect required)');
   } catch (error) {
     console.error('Restore error:', error);
   }
