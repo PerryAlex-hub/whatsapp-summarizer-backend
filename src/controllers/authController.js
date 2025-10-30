@@ -13,13 +13,10 @@ const { generateToken } = require('../middleware/auth');
  */
 const signup = async (req, res) => {
   try {
-    console.log('📝 Signup request received:', req.body.username);
-    
     const { username, password, phoneNumber } = req.body;
     
     // 1. Validate input
     if (!username || !password) {
-      console.log('❌ Missing username or password');
       return res.status(400).json({
         success: false,
         message: 'Username and password are required.',
@@ -28,7 +25,6 @@ const signup = async (req, res) => {
     
     // Check username length
     if (username.length < 3) {
-      console.log('❌ Username too short');
       return res.status(400).json({
         success: false,
         message: 'Username must be at least 3 characters long.',
@@ -37,7 +33,6 @@ const signup = async (req, res) => {
     
     // Check password length
     if (password.length < 6) {
-      console.log('❌ Password too short');
       return res.status(400).json({
         success: false,
         message: 'Password must be at least 6 characters long.',
@@ -48,7 +43,6 @@ const signup = async (req, res) => {
     const existingUser = await User.findByUsername(username);
     
     if (existingUser) {
-      console.log('❌ Username taken:', username);
       return res.status(409).json({
         success: false,
         message: 'Username already taken. Please choose another.',
@@ -64,7 +58,7 @@ const signup = async (req, res) => {
     
     // 4. Save to database
     const savedUser = await user.save();
-    console.log('✅ User saved:', savedUser._id);
+    console.log('✅ User saved to database:', savedUser._id);
     
     // 5. Generate JWT token
     const token = generateToken(savedUser._id);
@@ -74,14 +68,15 @@ const signup = async (req, res) => {
       success: true,
       message: 'Account created successfully!',
       token,
-      user: savedUser.toSafeObject(),
+      user: savedUser.toSafeObject(), // Don't send password
     });
     
   } catch (error) {
     console.error('❌ Signup error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error creating account: ' + error.message,
+      message: 'Error creating account. Please try again.',
+      error: error.message, // Include error for debugging
     });
   }
 };

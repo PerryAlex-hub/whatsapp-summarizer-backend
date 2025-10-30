@@ -1,13 +1,15 @@
 // ============================================
-// WHATSAPP SERVICE - FIXED VERSION
+// WHATSAPP CONNECTION SERVICE (MONGODB AUTH)
+// Stores auth in MongoDB instead of files
 // ============================================
 
 const { 
   default: makeWASocket,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
   useMultiFileAuthState,
+  BufferJSON,
+  initAuthCreds,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
@@ -15,53 +17,32 @@ const User = require('../models/User');
 const WhatsAppAuth = require('../models/WhatsAppAuth');
 const messageService = require('./messageService');
 
+// Store active connections in memory
 const activeConnections = new Map();
 
 /**
- * Create auth state for connections
- * FIXED: Properly handles undefined creds for fresh connections
+ * MongoDB-based auth state handler
  */
-const createAuthState = async (userId) => {
+const useMongoDBAuthState = async (userId) => {
+  // Load auth from MongoDB
   let authDoc = await WhatsAppAuth.findOne({ userId });
   
-  // If no auth or corrupted, create fresh
-  if (!authDoc || !authDoc.authState?.creds?.noiseKey?.public) {
-    console.log(`🆕 Creating fresh auth for ${userId}`);
-    await WhatsAppAuth.findOneAndDelete({ userId });
-    
-    // CRITICAL FIX: Return undefined creds for fresh connections
-    // This allows Baileys to generate new credentials
-    const saveState = async (newState) => {
-      await WhatsAppAuth.findOneAndUpdate(
-        { userId },
-        { 
-          authState: newState,
-          lastConnected: new Date(),
-        },
-        { upsert: true }
-      );
-    };
-    
-    return {
-      state: {
-        creds: undefined, // Let Baileys generate fresh creds
-        keys: makeCacheableSignalKeyStore({}, pino({ level: 'silent' })),
-      },
-      saveCreds: async (creds) => {
-        const currentState = { creds, keys: {} };
-        await saveState(currentState);
-      },
-    };
+  if (!authDoc) {
+    // Create new auth document with initial credentials
+    const creds = initAuthCreds();
+    authDoc = await WhatsAppAuth.create({
+      userId,
+      authState: { creds },
+    });
   }
   
-  // Existing auth found
-  const state = authDoc.authState;
+  const state = authDoc.authState || { creds: initAuthCreds() };
   
-  const saveState = async (newState) => {
+  const saveState = async () => {
     await WhatsAppAuth.findOneAndUpdate(
       { userId },
       { 
-        authState: newState,
+        authState: state,
         lastConnected: new Date(),
       },
       { upsert: true }
@@ -70,35 +51,44 @@ const createAuthState = async (userId) => {
   
   return {
     state: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys || {}, pino({ level: 'silent' })),
+      creds: state.creds || initAuthCreds(),
+      keys: state.keys || {},
     },
-    saveCreds: async (creds) => {
-      state.creds = creds;
-      await saveState(state);
+    saveCreds: async () => {
+      state.creds = arguments[0] || state.creds;
+      await saveState();
+    },
+    saveKeys: async () => {
+      state.keys = arguments[0] || state.keys;
+      await saveState();
     },
   };
 };
 
 /**
- * Initialize WhatsApp connection
+ * Initialize WhatsApp connection for a user
  */
 const initConnection = async (userId) => {
   try {
-    console.log(`🔄 Initializing WhatsApp for user: ${userId}`);
+    console.log(`🔄 Initializing WhatsApp connection for user: ${userId}`);
     
-    const { state, saveCreds } = await createAuthState(userId);
+    // Use MongoDB auth state
+    const { state, saveCreds } = await useMongoDBAuthState(userId);
+    
+    // Get latest WhatsApp version
     const { version } = await fetchLatestBaileysVersion();
     
+    // Create WhatsApp socket
     const sock = makeWASocket({
       version,
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
+      defaultQueryTimeoutMs: 60000,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 10000,
       browser: ['WhatsApp Summarizer', 'Chrome', '10.0'],
       syncFullHistory: false,
-      markOnlineOnConnect: false,
-      // ADDED: Prevents undefined errors
       getMessage: async (key) => {
         return { conversation: '' };
       },
@@ -107,10 +97,13 @@ const initConnection = async (userId) => {
     let qrCode = null;
     let connected = false;
     
+    // Store connection info
     activeConnections.set(userId, { sock, qrCode, connected });
     
+    // Save credentials
     sock.ev.on('creds.update', saveCreds);
     
+    // Handle connection updates
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       
@@ -119,9 +112,9 @@ const initConnection = async (userId) => {
           qrCode = await QRCode.toDataURL(qr);
           const conn = activeConnections.get(userId);
           if (conn) conn.qrCode = qrCode;
-          console.log(`📱 QR generated for ${userId}`);
+          console.log(`📱 QR code generated for user: ${userId}`);
         } catch (error) {
-          console.error('❌ QR error:', error);
+          console.error('QR code generation error:', error);
         }
       }
       
@@ -133,15 +126,15 @@ const initConnection = async (userId) => {
           conn.qrCode = null;
         }
         
+        // Update MongoDB
         await WhatsAppAuth.findOneAndUpdate(
           { userId },
-          { connected: true, lastConnected: new Date() },
-          { upsert: true }
+          { connected: true, lastConnected: new Date() }
         );
         
         await User.findByIdAndUpdate(userId, { whatsappConnected: true });
         
-        console.log(`✅ WhatsApp connected: ${userId}`);
+        console.log(`✅ WhatsApp connected for user: ${userId}`);
       }
       
       if (connection === 'close') {
@@ -149,34 +142,38 @@ const initConnection = async (userId) => {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         
-        console.log(`❌ Disconnected: ${userId}`);
-        console.log(`Error: ${lastDisconnect?.error?.message || 'Unknown'}`);
-        console.log(`Status: ${statusCode}`);
+        console.log(`❌ WhatsApp disconnected for user: ${userId}`);
+        console.log(`Reason: ${lastDisconnect?.error?.message || 'Unknown'}`);
+        
+        // Update MongoDB
+        await WhatsAppAuth.findOneAndUpdate(
+          { userId },
+          { connected: false }
+        );
         
         await User.findByIdAndUpdate(userId, { whatsappConnected: false });
         
-        if (shouldReconnect && statusCode !== 401) {
-          console.log(`🔄 Reconnecting ${userId} in 5s...`);
+        if (shouldReconnect) {
+          console.log(`🔄 Will reconnect user ${userId} in 5 seconds...`);
           setTimeout(() => initConnection(userId), 5000);
         } else {
-          // Delete corrupted auth
+          // Logged out - delete auth
           await WhatsAppAuth.findOneAndDelete({ userId });
           activeConnections.delete(userId);
-          console.log(`⛔ Logged out / Auth cleared: ${userId}`);
+          console.log(`⛔ User ${userId} logged out from WhatsApp`);
         }
       }
     });
     
+    // Handle incoming messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type === 'notify') {
         for (const msg of messages) {
           try {
-            const saved = await messageService.storeMessage(userId, msg);
-            if (saved) {
-              console.log(`💾 Saved: ${saved.chatId.substring(0, 15)}...`);
-            }
+            await messageService.storeMessage(userId, msg);
+            console.log(`💾 Message stored for user ${userId}`);
           } catch (error) {
-            console.error('❌ Save error:', error.message);
+            console.error('Error storing message:', error);
           }
         }
       }
@@ -185,13 +182,7 @@ const initConnection = async (userId) => {
     return { success: true, qrCode, connected };
     
   } catch (error) {
-    console.error(`❌ Connection error for ${userId}:`, error.message);
-    console.error(error.stack);
-    
-    // Clean up corrupted auth
-    await WhatsAppAuth.findOneAndDelete({ userId });
-    activeConnections.delete(userId);
-    
+    console.error('❌ WhatsApp connection error:', error);
     throw error;
   }
 };
@@ -205,18 +196,14 @@ const disconnect = async (userId) => {
     const connection = activeConnections.get(userId);
     
     if (connection?.sock) {
-      try {
-        await connection.sock.logout();
-      } catch (e) {
-        console.log('Logout error (expected):', e.message);
-      }
+      await connection.sock.logout();
     }
     
     activeConnections.delete(userId);
     await WhatsAppAuth.findOneAndDelete({ userId });
     await User.findByIdAndUpdate(userId, { whatsappConnected: false });
     
-    console.log(`👋 Disconnected: ${userId}`);
+    console.log(`👋 User ${userId} disconnected from WhatsApp`);
     return true;
   } catch (error) {
     console.error('Disconnect error:', error);
@@ -240,14 +227,24 @@ const getActiveConnectionsCount = () => {
 
 const restoreConnections = async () => {
   try {
-    console.log('🔄 Restoring connections...');
+    console.log('🔄 Restoring WhatsApp connections from MongoDB...');
     
-    // Don't auto-restore on startup (causes issues)
-    // Users need to reconnect manually
+    // Find all users with active auth sessions
+    const activeSessions = await WhatsAppAuth.find({ connected: true });
     
-    console.log('✅ Restoration skipped (manual reconnect required)');
+    console.log(`Found ${activeSessions.length} sessions to restore`);
+    
+    for (const session of activeSessions) {
+      try {
+        await initConnection(session.userId.toString());
+      } catch (error) {
+        console.error(`Failed to restore session for ${session.userId}:`, error);
+      }
+    }
+    
+    console.log('✅ Connection restoration complete');
   } catch (error) {
-    console.error('Restore error:', error);
+    console.error('Error restoring connections:', error);
   }
 };
 
