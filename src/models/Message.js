@@ -159,7 +159,7 @@ messageSchema.statics.searchChats = function (userId, searchTerm) {
   return this.aggregate([
     {
       $match: {
-        userId: mongoose.Types.ObjectId(userId),
+        userId: new mongoose.Types.ObjectId(userId),
         chatId: regex,
       },
     },
