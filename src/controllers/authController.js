@@ -56,24 +56,27 @@ const signup = async (req, res) => {
       phoneNumber: phoneNumber || null,
     });
     
-    await user.save();
+    // 4. Save to database
+    const savedUser = await user.save();
+    console.log('✅ User saved to database:', savedUser._id);
     
-    // 4. Generate JWT token
-    const token = generateToken(user._id);
+    // 5. Generate JWT token
+    const token = generateToken(savedUser._id);
     
-    // 5. Return success response
+    // 6. Return success response
     res.status(201).json({
       success: true,
       message: 'Account created successfully!',
       token,
-      user: user.toSafeObject(), // Don't send password
+      user: savedUser.toSafeObject(), // Don't send password
     });
     
   } catch (error) {
-    console.error('Signup error:', error);
+    console.error('❌ Signup error:', error);
     res.status(500).json({
       success: false,
       message: 'Error creating account. Please try again.',
+      error: error.message, // Include error for debugging
     });
   }
 };
