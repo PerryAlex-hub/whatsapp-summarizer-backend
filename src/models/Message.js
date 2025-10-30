@@ -120,7 +120,7 @@ messageSchema.statics.getChatMessages = function (userId, chatId, limit = 100) {
 messageSchema.statics.getUserChats = async function (userId) {
   return this.aggregate([
     // Match user's messages
-    { $match: { userId: mongoose.Types.ObjectId(userId) } },
+    { $match: { userId: new mongoose.Types.ObjectId(userId) } },
     
     // Group by chatId and count
     {
@@ -159,7 +159,7 @@ messageSchema.statics.searchChats = function (userId, searchTerm) {
   return this.aggregate([
     {
       $match: {
-        userId: mongoose.Types.ObjectId(userId),
+        userId: new mongoose.Types.ObjectId(userId),
         chatId: regex,
       },
     },
