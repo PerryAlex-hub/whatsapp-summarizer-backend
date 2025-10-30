@@ -1,5 +1,5 @@
 // ============================================
-// WHATSAPP SERVICE - FINAL WORKING VERSION
+// WHATSAPP SERVICE - FIXED VERSION
 // ============================================
 
 const { 
@@ -7,6 +7,7 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  useMultiFileAuthState,
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
@@ -17,7 +18,8 @@ const messageService = require('./messageService');
 const activeConnections = new Map();
 
 /**
- * Create fresh auth state for new connections
+ * Create auth state for connections
+ * FIXED: Properly handles undefined creds for fresh connections
  */
 const createAuthState = async (userId) => {
   let authDoc = await WhatsAppAuth.findOne({ userId });
@@ -26,10 +28,34 @@ const createAuthState = async (userId) => {
   if (!authDoc || !authDoc.authState?.creds?.noiseKey?.public) {
     console.log(`🆕 Creating fresh auth for ${userId}`);
     await WhatsAppAuth.findOneAndDelete({ userId });
-    authDoc = null;
+    
+    // CRITICAL FIX: Return undefined creds for fresh connections
+    // This allows Baileys to generate new credentials
+    const saveState = async (newState) => {
+      await WhatsAppAuth.findOneAndUpdate(
+        { userId },
+        { 
+          authState: newState,
+          lastConnected: new Date(),
+        },
+        { upsert: true }
+      );
+    };
+    
+    return {
+      state: {
+        creds: undefined, // Let Baileys generate fresh creds
+        keys: makeCacheableSignalKeyStore({}, pino({ level: 'silent' })),
+      },
+      saveCreds: async (creds) => {
+        const currentState = { creds, keys: {} };
+        await saveState(currentState);
+      },
+    };
   }
   
-  const state = authDoc?.authState || {};
+  // Existing auth found
+  const state = authDoc.authState;
   
   const saveState = async (newState) => {
     await WhatsAppAuth.findOneAndUpdate(
@@ -72,6 +98,10 @@ const initConnection = async (userId) => {
       browser: ['WhatsApp Summarizer', 'Chrome', '10.0'],
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      // ADDED: Prevents undefined errors
+      getMessage: async (key) => {
+        return { conversation: '' };
+      },
     });
     
     let qrCode = null;
@@ -156,6 +186,7 @@ const initConnection = async (userId) => {
     
   } catch (error) {
     console.error(`❌ Connection error for ${userId}:`, error.message);
+    console.error(error.stack);
     
     // Clean up corrupted auth
     await WhatsAppAuth.findOneAndDelete({ userId });
