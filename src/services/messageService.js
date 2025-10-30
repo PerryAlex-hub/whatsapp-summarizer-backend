@@ -112,7 +112,7 @@ const getUserChats = async (userId) => {
   try {
     const chats = await Message.aggregate([
       // Match user's messages
-      { $match: { userId: require('mongoose').Types.ObjectId(userId) } },
+      { $match: { userId: new require('mongoose').Types.ObjectId(userId) } },
       
       // Sort by timestamp to get latest message
       { $sort: { timestamp: -1 } },
